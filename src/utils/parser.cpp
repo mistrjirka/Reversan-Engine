@@ -121,7 +121,7 @@ bool Parser::parse_threads(int argc, char **argv, int &i) {
     if (i + 1 < argc) {
         i++;
         settings.thread_count = std::atoi(argv[i]);
-        if (settings.thread_count < 1 || settings.thread_count > 8) {
+        if (settings.thread_count < 1 || settings.thread_count > 128) {
             std::cout << "Invalid thread count. Use --help or -h for usage information.\n";
             return false;
         }
