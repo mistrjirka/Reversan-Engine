@@ -42,7 +42,6 @@ ALWAYS_INLINE int Board::rate_board() const {
 }
 
 ALWAYS_INLINE uint64_t Board::find_moves(bool color) const {
-    uint64_t valid_moves = 0;
     uint64_t free_spaces = ~(white_bitmap | black_bitmap);
 
     uint64_t playing;
@@ -56,7 +55,9 @@ ALWAYS_INLINE uint64_t Board::find_moves(bool color) const {
         opponent = white_bitmap;
     }
 
-    const size_t vl = __riscv_vsetvl_e64m1(4);
+    // LMUL=2 guarantees 4 elements for VLEN >= 128
+    // (m1 only holds VLEN/64 elements — on VLEN=128 that's 2, missing 2 directions!)
+    const size_t vl = __riscv_vsetvl_e64m2(4);
     const uint64_t shift_vals_data[4] = {1, 7, 8, 9};
     const uint64_t col_mask_data[4] = {
         Masks::SIDE_COLS_MASK,
@@ -65,32 +66,33 @@ ALWAYS_INLINE uint64_t Board::find_moves(bool color) const {
         Masks::SIDE_COLS_MASK
     };
 
-    vuint64m1_t shift_vals_vec = __riscv_vle64_v_u64m1(shift_vals_data, vl);
-    vuint64m1_t col_mask_vec = __riscv_vle64_v_u64m1(col_mask_data, vl);
-    vuint64m1_t opponent_vec = __riscv_vmv_v_x_u64m1(opponent, vl);
-    vuint64m1_t opponent_adjusted_vec = __riscv_vand_vv_u64m1(opponent_vec, col_mask_vec, vl);
-    vuint64m1_t ans_vec = __riscv_vmv_v_x_u64m1(playing, vl);
+    vuint64m2_t shift_vals_vec = __riscv_vle64_v_u64m2(shift_vals_data, vl);
+    vuint64m2_t col_mask_vec = __riscv_vle64_v_u64m2(col_mask_data, vl);
+    vuint64m2_t opponent_vec = __riscv_vmv_v_x_u64m2(opponent, vl);
+    vuint64m2_t opponent_adjusted_vec = __riscv_vand_vv_u64m2(opponent_vec, col_mask_vec, vl);
+    vuint64m2_t ans_vec = __riscv_vmv_v_x_u64m2(playing, vl);
 
-    vuint64m1_t left_shift_vec = __riscv_vsll_vv_u64m1(ans_vec, shift_vals_vec, vl);
-    vuint64m1_t right_shift_vec = __riscv_vsrl_vv_u64m1(ans_vec, shift_vals_vec, vl);
-    vuint64m1_t tmp_or_vec = __riscv_vor_vv_u64m1(left_shift_vec, right_shift_vec, vl);
-    ans_vec = __riscv_vand_vv_u64m1(tmp_or_vec, opponent_adjusted_vec, vl);
+    vuint64m2_t left_shift_vec = __riscv_vsll_vv_u64m2(ans_vec, shift_vals_vec, vl);
+    vuint64m2_t right_shift_vec = __riscv_vsrl_vv_u64m2(ans_vec, shift_vals_vec, vl);
+    vuint64m2_t tmp_or_vec = __riscv_vor_vv_u64m2(left_shift_vec, right_shift_vec, vl);
+    ans_vec = __riscv_vand_vv_u64m2(tmp_or_vec, opponent_adjusted_vec, vl);
 
     for (int i = 0; i < 5; ++i) {
-        left_shift_vec = __riscv_vsll_vv_u64m1(ans_vec, shift_vals_vec, vl);
-        right_shift_vec = __riscv_vsrl_vv_u64m1(ans_vec, shift_vals_vec, vl);
-        tmp_or_vec = __riscv_vor_vv_u64m1(left_shift_vec, right_shift_vec, vl);
-        vuint64m1_t tmp_and_vec = __riscv_vand_vv_u64m1(tmp_or_vec, opponent_adjusted_vec, vl);
-        ans_vec = __riscv_vor_vv_u64m1(ans_vec, tmp_and_vec, vl);
+        left_shift_vec = __riscv_vsll_vv_u64m2(ans_vec, shift_vals_vec, vl);
+        right_shift_vec = __riscv_vsrl_vv_u64m2(ans_vec, shift_vals_vec, vl);
+        tmp_or_vec = __riscv_vor_vv_u64m2(left_shift_vec, right_shift_vec, vl);
+        vuint64m2_t tmp_and_vec = __riscv_vand_vv_u64m2(tmp_or_vec, opponent_adjusted_vec, vl);
+        ans_vec = __riscv_vor_vv_u64m2(ans_vec, tmp_and_vec, vl);
     }
 
-    left_shift_vec = __riscv_vsll_vv_u64m1(ans_vec, shift_vals_vec, vl);
-    right_shift_vec = __riscv_vsrl_vv_u64m1(ans_vec, shift_vals_vec, vl);
-    tmp_or_vec = __riscv_vor_vv_u64m1(left_shift_vec, right_shift_vec, vl);
+    left_shift_vec = __riscv_vsll_vv_u64m2(ans_vec, shift_vals_vec, vl);
+    right_shift_vec = __riscv_vsrl_vv_u64m2(ans_vec, shift_vals_vec, vl);
+    tmp_or_vec = __riscv_vor_vv_u64m2(left_shift_vec, right_shift_vec, vl);
 
-    uint64_t valid_moves_data[4];
-    __riscv_vse64_v_u64m1(valid_moves_data, tmp_or_vec, vl);
-    valid_moves = valid_moves_data[0] | valid_moves_data[1] | valid_moves_data[2] | valid_moves_data[3];
+    // Vector reduction OR — all 4 directions merged in-register, no memory round-trip
+    vuint64m1_t zero_scalar = __riscv_vmv_v_x_u64m1(0, 1);
+    vuint64m1_t reduced = __riscv_vredor_vs_u64m2_u64m1(tmp_or_vec, zero_scalar, vl);
+    uint64_t valid_moves = __riscv_vmv_x_s_u64m1_u64(reduced);
 
     valid_moves &= free_spaces;
     return valid_moves;
