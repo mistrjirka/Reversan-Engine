@@ -28,13 +28,66 @@
 #include <bit>
 #include <riscv_vector.h>
 
-ALWAYS_INLINE int Board::rate_board() const {
-    int score = 0;
-    for (int i = 0; i < 64; ++i) {
-        score += ((white_bitmap >> i) & 1) * heuristics_map[63 - i];
-        score -= ((black_bitmap >> i) & 1) * heuristics_map[63 - i];
+// Heuristics map converted to column-interleaved byte layout for SIMD.
+// Each u64 holds 8 heuristic weights (as signed bytes) for one board column,
+// matching the order produced by right-shifting the bitmap and masking with 0x01.
+constexpr uint64_t rvv_convert_col(int col) {
+    uint64_t val = 0;
+    for (int i = 0; i < 8; ++i) {
+        val <<= 8;
+        val |= static_cast<uint8_t>(Board::heuristics_map[i * 8 + col]);
     }
+    return val;
+}
 
+static constexpr uint64_t heur_cols[8] = {
+    rvv_convert_col(0), rvv_convert_col(1), rvv_convert_col(2), rvv_convert_col(3),
+    rvv_convert_col(4), rvv_convert_col(5), rvv_convert_col(6), rvv_convert_col(7)
+};
+
+ALWAYS_INLINE int Board::rate_board() const {
+    // --- Phase 1: Extract per-column bit presence as bytes (e64, 8 elements) ---
+    // Shift bitmap by {7,6,...,0} to align each column's bits into bit 0 of each byte,
+    // then mask with 0x01. Result: 8 × u64 = 64 bytes, each 0 or 1.
+    // Requires LMUL=2 to hold 8 × u64 on VLEN=256.
+    const size_t vl8 = __riscv_vsetvl_e64m2(8);
+    static const uint64_t shift_vals[8] = {7, 6, 5, 4, 3, 2, 1, 0};
+
+    vuint64m2_t shift_vec = __riscv_vle64_v_u64m2(shift_vals, vl8);
+
+    vuint64m2_t white_vec = __riscv_vmv_v_x_u64m2(white_bitmap, vl8);
+    white_vec = __riscv_vsrl_vv_u64m2(white_vec, shift_vec, vl8);
+    white_vec = __riscv_vand_vx_u64m2(white_vec, 0x0101010101010101ULL, vl8);
+
+    vuint64m2_t black_vec = __riscv_vmv_v_x_u64m2(black_bitmap, vl8);
+    black_vec = __riscv_vsrl_vv_u64m2(black_vec, shift_vec, vl8);
+    black_vec = __riscv_vand_vx_u64m2(black_vec, 0x0101010101010101ULL, vl8);
+
+    // --- Phase 2: Byte-level multiply + reduce (e8/e16, 64 elements) ---
+    // Reinterpret the 8×u64 as 64×u8, then compute (white - black) per position,
+    // widening-multiply by heuristic weights, and reduce-sum.
+    vuint8m2_t white_bytes = __riscv_vreinterpret_v_u64m2_u8m2(white_vec);
+    vuint8m2_t black_bytes = __riscv_vreinterpret_v_u64m2_u8m2(black_vec);
+
+    const size_t vl64 = __riscv_vsetvl_e8m2(64);
+
+    // delta = white - black ∈ {-1, 0, 1} per position
+    vint8m2_t white_i8 = __riscv_vreinterpret_v_u8m2_i8m2(white_bytes);
+    vint8m2_t black_i8 = __riscv_vreinterpret_v_u8m2_i8m2(black_bytes);
+    vint8m2_t delta = __riscv_vsub_vv_i8m2(white_i8, black_i8, vl64);
+
+    // Load column-layout heuristic weights as 64 × i8
+    vint8m2_t heur_vec = __riscv_vle8_v_i8m2((const int8_t*)heur_cols, vl64);
+
+    // Widening signed multiply: i8 × i8 → i16 (m2 × m2 → m4)
+    vint16m4_t products = __riscv_vwmul_vv_i16m4(delta, heur_vec, vl64);
+
+    // Reduce sum all 64 × i16 → single i16
+    vint16m1_t zero_i16 = __riscv_vmv_v_x_i16m1(0, 1);
+    vint16m1_t sum_vec = __riscv_vredsum_vs_i16m4_i16m1(products, zero_i16, vl64);
+    int score = (int)__riscv_vmv_x_s_i16m1_i16(sum_vec);
+
+    // --- Mobility scoring ---
     int moves_delta = std::popcount(find_moves(true)) - std::popcount(find_moves(false));
     score += 10 * moves_delta;
 
