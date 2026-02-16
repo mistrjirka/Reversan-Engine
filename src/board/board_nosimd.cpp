@@ -29,11 +29,24 @@
 
 ALWAYS_INLINE int Board::rate_board() const {
     int score = 0;
-    for (int i = 0; i < 64; ++i) {
-        score += ((white_bitmap >> i) & 1) * heuristics_map[63 - i];
-        score -= ((black_bitmap >> i) & 1) * heuristics_map[63 - i];
+
+    // Iterate only over set bits — no multiply needed (each bit = 1).
+    // Typical Othello board has 40-60 pieces, so this does ~50 iterations
+    // with cheap ctz+clear vs the old 64 iterations with 2 multiplies each.
+    uint64_t w = white_bitmap;
+    while (w) {
+        int i = std::countr_zero(w);  // index of lowest set bit
+        score += heuristics_map[63 - i];
+        w &= w - 1;                   // clear lowest set bit
     }
-    
+
+    uint64_t b = black_bitmap;
+    while (b) {
+        int i = std::countr_zero(b);
+        score -= heuristics_map[63 - i];
+        b &= b - 1;
+    }
+
     int moves_delta = std::popcount(find_moves(true)) - std::popcount(find_moves(false));
     score += 10 * moves_delta;
 
