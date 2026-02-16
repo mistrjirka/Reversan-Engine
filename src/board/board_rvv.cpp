@@ -165,8 +165,8 @@ ALWAYS_INLINE void Board::play_move(bool color, uint64_t move) {
     }
 
     const size_t vl = __riscv_vsetvl_e64m1(4);
-    const uint64_t shift_vals_data[4] = {1, 7, 8, 9};
-    const uint64_t col_mask_data[4] = {
+    static const uint64_t shift_vals_data[4] = {1, 7, 8, 9};
+    static const uint64_t col_mask_data[4] = {
         Masks::SIDE_COLS_MASK,
         Masks::SIDE_COLS_MASK,
         Masks::NO_COL_MASK,
@@ -175,10 +175,11 @@ ALWAYS_INLINE void Board::play_move(bool color, uint64_t move) {
 
     vuint64m1_t shift_vals_vec = __riscv_vle64_v_u64m1(shift_vals_data, vl);
     vuint64m1_t col_mask_vec = __riscv_vle64_v_u64m1(col_mask_data, vl);
-    vuint64m1_t move_vec = __riscv_vmv_v_x_u64m1(move, vl);
-    vuint64m1_t opponent_vec = __riscv_vmv_v_x_u64m1(opponent, vl);
-    vuint64m1_t opponent_adjusted_vec = __riscv_vand_vv_u64m1(opponent_vec, col_mask_vec, vl);
+    vuint64m1_t playing_vec = __riscv_vmv_v_x_u64m1(playing, vl);
+    vuint64m1_t opponent_adjusted_vec = __riscv_vand_vx_u64m1(col_mask_vec, opponent, vl);
 
+    // First shift from the move position
+    vuint64m1_t move_vec = __riscv_vmv_v_x_u64m1(move, vl);
     vuint64m1_t left_shift_vec = __riscv_vsll_vv_u64m1(move_vec, shift_vals_vec, vl);
     vuint64m1_t right_shift_vec = __riscv_vsrl_vv_u64m1(move_vec, shift_vals_vec, vl);
     left_shift_vec = __riscv_vand_vv_u64m1(left_shift_vec, opponent_adjusted_vec, vl);
@@ -198,24 +199,26 @@ ALWAYS_INLINE void Board::play_move(bool color, uint64_t move) {
         right_shift_vec = __riscv_vand_vv_u64m1(right_shift_vec, opponent_adjusted_vec, vl);
     }
 
-    uint64_t left_data[4];
-    uint64_t right_data[4];
-    uint64_t left_next_data[4];
-    uint64_t right_next_data[4];
-    __riscv_vse64_v_u64m1(left_data, left_shift_vec, vl);
-    __riscv_vse64_v_u64m1(right_data, right_shift_vec, vl);
-    __riscv_vse64_v_u64m1(left_next_data, left_shift_vec_next, vl);
-    __riscv_vse64_v_u64m1(right_next_data, right_shift_vec_next, vl);
+    // Branch-free capture validation using vector masks (like AVX2 cmpeq+andnot).
+    // Check if the next position beyond the line hits a friendly piece.
+    // If (next & playing) != 0, the line is valid → keep it; otherwise zero it out.
+    vuint64m1_t zero_vec = __riscv_vmv_v_x_u64m1(0, vl);
+    vuint64m1_t left_check = __riscv_vand_vv_u64m1(left_shift_vec_next, playing_vec, vl);
+    vuint64m1_t right_check = __riscv_vand_vv_u64m1(right_shift_vec_next, playing_vec, vl);
 
-    uint64_t capture = 0;
-    for (int i = 0; i < 4; ++i) {
-        if ((left_next_data[i] & playing) != 0) {
-            capture |= left_data[i];
-        }
-        if ((right_next_data[i] & playing) != 0) {
-            capture |= right_data[i];
-        }
-    }
+    // Create masks: true where check != 0 (i.e., friendly piece found)
+    vbool64_t left_valid = __riscv_vmsne_vv_u64m1_b64(left_check, zero_vec, vl);
+    vbool64_t right_valid = __riscv_vmsne_vv_u64m1_b64(right_check, zero_vec, vl);
+
+    // Zero out invalid captures, keep valid ones
+    vuint64m1_t capture_left = __riscv_vmerge_vvm_u64m1(zero_vec, left_shift_vec, left_valid, vl);
+    vuint64m1_t capture_right = __riscv_vmerge_vvm_u64m1(zero_vec, right_shift_vec, right_valid, vl);
+
+    // OR all captures together using reduction
+    vuint64m1_t capture_all = __riscv_vor_vv_u64m1(capture_left, capture_right, vl);
+    vuint64m1_t zero_scalar = __riscv_vmv_v_x_u64m1(0, 1);
+    vuint64m1_t reduced = __riscv_vredor_vs_u64m1_u64m1(capture_all, zero_scalar, vl);
+    uint64_t capture = __riscv_vmv_x_s_u64m1_u64(reduced);
 
     playing |= move;
     playing |= capture;
