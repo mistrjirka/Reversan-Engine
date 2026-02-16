@@ -52,18 +52,25 @@ set(SOURCES_AVX2
     src/board/board_avx2.cpp
 )
 
+# Source files for the RVV variant
+set(SOURCES_RVV
+    src/board/board_rvv.cpp
+)
+
 # Compile flags
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -Wno-attributes")
     set(OPT_FLAG "-O3")
     set(PROFILE_FLAG "-pg")
     set(AVX2_FLAG "-mavx2")
+    set(RVV_FLAG "-march=rv64gcv -mabi=lp64d")
     message(STATUS "GNU | Clang compiler detected")
 elseif(MSVC)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /W4 /WX")
     set(OPT_FLAG "/O2")
     set(PROFILE_FLAG "/PROFILE")
     set(AVX2_FLAG "/arch:AVX2")
+    set(RVV_FLAG "")
     message(STATUS "MSVC compiler detected")
 else()
     message(FATAL_ERROR "Unsupported compiler")
@@ -77,6 +84,15 @@ if(AVX2)
     message(STATUS "AVX2 support detected")
 else()
     message(STATUS "AVX2 not supported")
+endif()
+
+# Check RVV support and inform user
+include(CheckCXXCompilerFlag)
+check_cxx_compiler_flag("-march=rv64gcv" RVV)
+if(RVV)
+    message(STATUS "RVV support detected")
+else()
+    message(STATUS "RVV not supported")
 endif()
 
 # Check LTO/IPO support and inform user
@@ -110,6 +126,19 @@ if(LTO)
     set_target_properties(reversan_nosimd PROPERTIES INTERPROCEDURAL_OPTIMIZATION TRUE)
 endif()
 
+# Create RVV targets
+if(RVV)
+    add_executable(reversan_rvv ${SOURCES} ${SOURCES_RVV})
+    target_compile_options(reversan_rvv PRIVATE ${OPT_FLAG} ${RVV_FLAG})
+    target_link_options(reversan_rvv PRIVATE ${RVV_FLAG} -static)
+
+    if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+        add_executable(reversan_rvv_debug ${SOURCES} ${SOURCES_RVV})
+        target_compile_options(reversan_rvv_debug PRIVATE ${PROFILE_FLAG} ${RVV_FLAG})
+        target_link_options(reversan_rvv_debug PRIVATE ${PROFILE_FLAG} ${RVV_FLAG} -static)
+    endif()
+endif()
+
 # Debug version for No SIMD
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     add_executable(reversan_nosimd_debug ${SOURCES} ${SOURCES_NOSIMD})
@@ -123,5 +152,7 @@ add_custom_target(clean_all
     COMMAND ${CMAKE_COMMAND} -E remove ${CMAKE_SOURCE_DIR}/reversan_avx2_debug
     COMMAND ${CMAKE_COMMAND} -E remove ${CMAKE_SOURCE_DIR}/reversan_nosimd
     COMMAND ${CMAKE_COMMAND} -E remove ${CMAKE_SOURCE_DIR}/reversan_nosimd_debug
+    COMMAND ${CMAKE_COMMAND} -E remove ${CMAKE_SOURCE_DIR}/reversan_rvv
+    COMMAND ${CMAKE_COMMAND} -E remove ${CMAKE_SOURCE_DIR}/reversan_rvv_debug
     COMMAND ${CMAKE_COMMAND} -E remove_directory ${CMAKE_BINARY_DIR}
 )

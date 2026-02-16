@@ -49,6 +49,10 @@ OBJECTS_NOSIMD = $(OBJECTS) $(addprefix $(BUILD_DIR)/,$(SOURCES_NOSIMD:%.cpp=%.o
 SOURCES_AVX2 = board/board_avx2.cpp
 OBJECTS_AVX2 = $(OBJECTS) $(addprefix $(BUILD_DIR)/,$(SOURCES_AVX2:%.cpp=%.o))
 
+# Sources when building with explicit RVV 1.0 instructions
+SOURCES_RVV = board/board_rvv.cpp
+OBJECTS_RVV = $(OBJECTS) $(addprefix $(BUILD_DIR)/,$(SOURCES_RVV:%.cpp=%.o))
+
 # Name of final executable
 TARGET_EXE = reversan
 
@@ -63,9 +67,20 @@ debug: all
 no_simd: $(OBJECTS_NOSIMD)
 	$(LINKER) $(LINKER_FLAGS) $^ -o $(TARGET_EXE)
 
+rvv: CXX_FLAGS := $(filter-out -flto,$(CXX_FLAGS))
+rvv: LINKER_FLAGS := $(filter-out -flto,$(LINKER_FLAGS))
+rvv: CXX_FLAGS += -march=rv64gcv -mabi=lp64d
+rvv: LINKER_FLAGS += -march=rv64gcv -mabi=lp64d -static
+rvv: $(OBJECTS_RVV)
+	$(LINKER) $(LINKER_FLAGS) $^ -o $(TARGET_EXE)
+
 debug_no_simd: CXX_FLAGS += -pg
 debug_no_simd: LINKER_FLAGS += -pg
 debug_no_simd: no_simd
+
+debug_rvv: CXX_FLAGS += -pg
+debug_rvv: LINKER_FLAGS += -pg
+debug_rvv: rvv
 
 clean:
 	rm -f -r $(BUILD_DIR)
