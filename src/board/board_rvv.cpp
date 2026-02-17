@@ -45,15 +45,59 @@ static constexpr uint64_t heur_cols[8] = {
     rvv_convert_col(4), rvv_convert_col(5), rvv_convert_col(6), rvv_convert_col(7)
 };
 
-ALWAYS_INLINE int Board::rate_board() const {
-    // --- Phase 1: Extract per-column bit presence as bytes (e64, 8 elements) ---
-    // Shift bitmap by {7,6,...,0} to align each column's bits into bit 0 of each byte,
-    // then mask with 0x01. Result: 8 × u64 = 64 bytes, each 0 or 1.
-    // Requires LMUL=2 to hold 8 × u64 on VLEN=256.
-    const size_t vl8 = __riscv_vsetvl_e64m2(8);
-    static const uint64_t shift_vals[8] = {7, 6, 5, 4, 3, 2, 1, 0};
+// Shared constants for find_moves / play_move (loaded once from .rodata)
+static const uint64_t shift_vals_data[4] = {1, 7, 8, 9};
+static const uint64_t col_mask_data[4] = {
+    0x7e7e7e7e7e7e7e7eULL,  // SIDE_COLS_MASK
+    0x7e7e7e7e7e7e7e7eULL,  // SIDE_COLS_MASK
+    0xffffffffffffffffULL,  // NO_COL_MASK
+    0x7e7e7e7e7e7e7e7eULL   // SIDE_COLS_MASK
+};
 
-    vuint64m2_t shift_vec = __riscv_vle64_v_u64m2(shift_vals, vl8);
+// Helper: run the flood-fill for one color, returning valid moves bitmap.
+// Assumes shift_vals_vec, col_mask_vec, and vl are already set up.
+static inline uint64_t find_moves_core(
+    uint64_t playing, uint64_t opponent, uint64_t free_spaces,
+    vuint64m1_t shift_vals_vec, vuint64m1_t col_mask_vec, size_t vl)
+{
+    vuint64m1_t opponent_adjusted_vec = __riscv_vand_vx_u64m1(col_mask_vec, opponent, vl);
+    vuint64m1_t ans_vec = __riscv_vmv_v_x_u64m1(playing, vl);
+
+    vuint64m1_t left_shift_vec = __riscv_vsll_vv_u64m1(ans_vec, shift_vals_vec, vl);
+    vuint64m1_t right_shift_vec = __riscv_vsrl_vv_u64m1(ans_vec, shift_vals_vec, vl);
+    vuint64m1_t tmp_or_vec = __riscv_vor_vv_u64m1(left_shift_vec, right_shift_vec, vl);
+    ans_vec = __riscv_vand_vv_u64m1(tmp_or_vec, opponent_adjusted_vec, vl);
+
+    // Fully unrolled 5 iterations — eliminates branch overhead on in-order cores
+    #define FLOOD_STEP \
+        left_shift_vec = __riscv_vsll_vv_u64m1(ans_vec, shift_vals_vec, vl); \
+        right_shift_vec = __riscv_vsrl_vv_u64m1(ans_vec, shift_vals_vec, vl); \
+        tmp_or_vec = __riscv_vor_vv_u64m1(left_shift_vec, right_shift_vec, vl); \
+        ans_vec = __riscv_vor_vv_u64m1(ans_vec, \
+            __riscv_vand_vv_u64m1(tmp_or_vec, opponent_adjusted_vec, vl), vl);
+
+    FLOOD_STEP
+    FLOOD_STEP
+    FLOOD_STEP
+    FLOOD_STEP
+    FLOOD_STEP
+    #undef FLOOD_STEP
+
+    left_shift_vec = __riscv_vsll_vv_u64m1(ans_vec, shift_vals_vec, vl);
+    right_shift_vec = __riscv_vsrl_vv_u64m1(ans_vec, shift_vals_vec, vl);
+    tmp_or_vec = __riscv_vor_vv_u64m1(left_shift_vec, right_shift_vec, vl);
+
+    vuint64m1_t zero_scalar = __riscv_vmv_v_x_u64m1(0, 1);
+    vuint64m1_t reduced = __riscv_vredor_vs_u64m1_u64m1(tmp_or_vec, zero_scalar, vl);
+    return __riscv_vmv_x_s_u64m1_u64(reduced) & free_spaces;
+}
+
+ALWAYS_INLINE int Board::rate_board() const {
+    // --- Heuristic scoring (vectorized) ---
+    const size_t vl8 = __riscv_vsetvl_e64m2(8);
+    static const uint64_t shift_vals_8[8] = {7, 6, 5, 4, 3, 2, 1, 0};
+
+    vuint64m2_t shift_vec = __riscv_vle64_v_u64m2(shift_vals_8, vl8);
 
     vuint64m2_t white_vec = __riscv_vmv_v_x_u64m2(white_bitmap, vl8);
     white_vec = __riscv_vsrl_vv_u64m2(white_vec, shift_vec, vl8);
@@ -63,32 +107,32 @@ ALWAYS_INLINE int Board::rate_board() const {
     black_vec = __riscv_vsrl_vv_u64m2(black_vec, shift_vec, vl8);
     black_vec = __riscv_vand_vx_u64m2(black_vec, 0x0101010101010101ULL, vl8);
 
-    // --- Phase 2: Byte-level multiply + reduce (e8/e16, 64 elements) ---
-    // Reinterpret the 8×u64 as 64×u8, then compute (white - black) per position,
-    // widening-multiply by heuristic weights, and reduce-sum.
     vuint8m2_t white_bytes = __riscv_vreinterpret_v_u64m2_u8m2(white_vec);
     vuint8m2_t black_bytes = __riscv_vreinterpret_v_u64m2_u8m2(black_vec);
 
     const size_t vl64 = __riscv_vsetvl_e8m2(64);
 
-    // delta = white - black ∈ {-1, 0, 1} per position
     vint8m2_t white_i8 = __riscv_vreinterpret_v_u8m2_i8m2(white_bytes);
     vint8m2_t black_i8 = __riscv_vreinterpret_v_u8m2_i8m2(black_bytes);
     vint8m2_t delta = __riscv_vsub_vv_i8m2(white_i8, black_i8, vl64);
 
-    // Load column-layout heuristic weights as 64 × i8
     vint8m2_t heur_vec = __riscv_vle8_v_i8m2((const int8_t*)heur_cols, vl64);
-
-    // Widening signed multiply: i8 × i8 → i16 (m2 × m2 → m4)
     vint16m4_t products = __riscv_vwmul_vv_i16m4(delta, heur_vec, vl64);
 
-    // Reduce sum all 64 × i16 → single i16
     vint16m1_t zero_i16 = __riscv_vmv_v_x_i16m1(0, 1);
     vint16m1_t sum_vec = __riscv_vredsum_vs_i16m4_i16m1(products, zero_i16, vl64);
     int score = (int)__riscv_vmv_x_s_i16m1_i16(sum_vec);
 
-    // --- Mobility scoring ---
-    int moves_delta = std::popcount(find_moves(true)) - std::popcount(find_moves(false));
+    // --- Mobility scoring: inline both find_moves calls, sharing setup ---
+    uint64_t free_spaces = ~(white_bitmap | black_bitmap);
+    const size_t vl4 = __riscv_vsetvl_e64m1(4);
+    vuint64m1_t sv = __riscv_vle64_v_u64m1(shift_vals_data, vl4);
+    vuint64m1_t cm = __riscv_vle64_v_u64m1(col_mask_data, vl4);
+
+    uint64_t white_moves = find_moves_core(white_bitmap, black_bitmap, free_spaces, sv, cm, vl4);
+    uint64_t black_moves = find_moves_core(black_bitmap, white_bitmap, free_spaces, sv, cm, vl4);
+
+    int moves_delta = std::popcount(white_moves) - std::popcount(black_moves);
     score += 10 * moves_delta;
 
     return score;
@@ -97,59 +141,20 @@ ALWAYS_INLINE int Board::rate_board() const {
 ALWAYS_INLINE uint64_t Board::find_moves(bool color) const {
     uint64_t free_spaces = ~(white_bitmap | black_bitmap);
 
-    uint64_t playing;
-    uint64_t opponent;
+    uint64_t playing, opponent;
     if (color) {
         playing = white_bitmap;
         opponent = black_bitmap;
-    }
-    else {
+    } else {
         playing = black_bitmap;
         opponent = white_bitmap;
     }
 
-    // On VLEN=256 (SpacemiT X60), m1 holds 4 × u64 — all 4 directions fit
     const size_t vl = __riscv_vsetvl_e64m1(4);
+    vuint64m1_t sv = __riscv_vle64_v_u64m1(shift_vals_data, vl);
+    vuint64m1_t cm = __riscv_vle64_v_u64m1(col_mask_data, vl);
 
-    // Static arrays stay in .rodata, always hot in L1 — avoids
-    // stack materialization overhead on every call
-    static const uint64_t shift_vals_data[4] = {1, 7, 8, 9};
-    static const uint64_t col_mask_data[4] = {
-        Masks::SIDE_COLS_MASK,
-        Masks::SIDE_COLS_MASK,
-        Masks::NO_COL_MASK,
-        Masks::SIDE_COLS_MASK
-    };
-
-    vuint64m1_t shift_vals_vec = __riscv_vle64_v_u64m1(shift_vals_data, vl);
-    vuint64m1_t col_mask_vec = __riscv_vle64_v_u64m1(col_mask_data, vl);
-    vuint64m1_t opponent_adjusted_vec = __riscv_vand_vx_u64m1(col_mask_vec, opponent, vl);
-    vuint64m1_t ans_vec = __riscv_vmv_v_x_u64m1(playing, vl);
-
-    vuint64m1_t left_shift_vec = __riscv_vsll_vv_u64m1(ans_vec, shift_vals_vec, vl);
-    vuint64m1_t right_shift_vec = __riscv_vsrl_vv_u64m1(ans_vec, shift_vals_vec, vl);
-    vuint64m1_t tmp_or_vec = __riscv_vor_vv_u64m1(left_shift_vec, right_shift_vec, vl);
-    ans_vec = __riscv_vand_vv_u64m1(tmp_or_vec, opponent_adjusted_vec, vl);
-
-    for (int i = 0; i < 5; ++i) {
-        left_shift_vec = __riscv_vsll_vv_u64m1(ans_vec, shift_vals_vec, vl);
-        right_shift_vec = __riscv_vsrl_vv_u64m1(ans_vec, shift_vals_vec, vl);
-        tmp_or_vec = __riscv_vor_vv_u64m1(left_shift_vec, right_shift_vec, vl);
-        vuint64m1_t tmp_and_vec = __riscv_vand_vv_u64m1(tmp_or_vec, opponent_adjusted_vec, vl);
-        ans_vec = __riscv_vor_vv_u64m1(ans_vec, tmp_and_vec, vl);
-    }
-
-    left_shift_vec = __riscv_vsll_vv_u64m1(ans_vec, shift_vals_vec, vl);
-    right_shift_vec = __riscv_vsrl_vv_u64m1(ans_vec, shift_vals_vec, vl);
-    tmp_or_vec = __riscv_vor_vv_u64m1(left_shift_vec, right_shift_vec, vl);
-
-    // Vector reduction OR — merge all 4 directions in-register, no store+load round-trip
-    vuint64m1_t zero_scalar = __riscv_vmv_v_x_u64m1(0, 1);
-    vuint64m1_t reduced = __riscv_vredor_vs_u64m1_u64m1(tmp_or_vec, zero_scalar, vl);
-    uint64_t valid_moves = __riscv_vmv_x_s_u64m1_u64(reduced);
-
-    valid_moves &= free_spaces;
-    return valid_moves;
+    return find_moves_core(playing, opponent, free_spaces, sv, cm, vl);
 }
 
 ALWAYS_INLINE void Board::play_move(bool color, uint64_t move) {
@@ -165,56 +170,50 @@ ALWAYS_INLINE void Board::play_move(bool color, uint64_t move) {
     }
 
     const size_t vl = __riscv_vsetvl_e64m1(4);
-    static const uint64_t shift_vals_data[4] = {1, 7, 8, 9};
-    static const uint64_t col_mask_data[4] = {
-        Masks::SIDE_COLS_MASK,
-        Masks::SIDE_COLS_MASK,
-        Masks::NO_COL_MASK,
-        Masks::SIDE_COLS_MASK
-    };
-
     vuint64m1_t shift_vals_vec = __riscv_vle64_v_u64m1(shift_vals_data, vl);
     vuint64m1_t col_mask_vec = __riscv_vle64_v_u64m1(col_mask_data, vl);
     vuint64m1_t playing_vec = __riscv_vmv_v_x_u64m1(playing, vl);
     vuint64m1_t opponent_adjusted_vec = __riscv_vand_vx_u64m1(col_mask_vec, opponent, vl);
 
-    // First shift from the move position
     vuint64m1_t move_vec = __riscv_vmv_v_x_u64m1(move, vl);
     vuint64m1_t left_shift_vec = __riscv_vsll_vv_u64m1(move_vec, shift_vals_vec, vl);
     vuint64m1_t right_shift_vec = __riscv_vsrl_vv_u64m1(move_vec, shift_vals_vec, vl);
     left_shift_vec = __riscv_vand_vv_u64m1(left_shift_vec, opponent_adjusted_vec, vl);
     right_shift_vec = __riscv_vand_vv_u64m1(right_shift_vec, opponent_adjusted_vec, vl);
 
-    vuint64m1_t left_shift_vec_next = left_shift_vec;
-    vuint64m1_t right_shift_vec_next = right_shift_vec;
+    vuint64m1_t left_shift_vec_next;
+    vuint64m1_t right_shift_vec_next;
 
-    for (int i = 0; i < 6; ++i) {
-        left_shift_vec_next = __riscv_vsll_vv_u64m1(left_shift_vec, shift_vals_vec, vl);
-        right_shift_vec_next = __riscv_vsrl_vv_u64m1(right_shift_vec, shift_vals_vec, vl);
+    // Fully unrolled 6 iterations — eliminates branch overhead on in-order X60
+    #define PLAY_STEP \
+        left_shift_vec_next = __riscv_vsll_vv_u64m1(left_shift_vec, shift_vals_vec, vl); \
+        right_shift_vec_next = __riscv_vsrl_vv_u64m1(right_shift_vec, shift_vals_vec, vl); \
+        left_shift_vec = __riscv_vand_vv_u64m1( \
+            __riscv_vor_vv_u64m1(left_shift_vec, left_shift_vec_next, vl), \
+            opponent_adjusted_vec, vl); \
+        right_shift_vec = __riscv_vand_vv_u64m1( \
+            __riscv_vor_vv_u64m1(right_shift_vec, right_shift_vec_next, vl), \
+            opponent_adjusted_vec, vl);
 
-        left_shift_vec = __riscv_vor_vv_u64m1(left_shift_vec, left_shift_vec_next, vl);
-        right_shift_vec = __riscv_vor_vv_u64m1(right_shift_vec, right_shift_vec_next, vl);
+    PLAY_STEP
+    PLAY_STEP
+    PLAY_STEP
+    PLAY_STEP
+    PLAY_STEP
+    PLAY_STEP
+    #undef PLAY_STEP
 
-        left_shift_vec = __riscv_vand_vv_u64m1(left_shift_vec, opponent_adjusted_vec, vl);
-        right_shift_vec = __riscv_vand_vv_u64m1(right_shift_vec, opponent_adjusted_vec, vl);
-    }
-
-    // Branch-free capture validation using vector masks (like AVX2 cmpeq+andnot).
-    // Check if the next position beyond the line hits a friendly piece.
-    // If (next & playing) != 0, the line is valid → keep it; otherwise zero it out.
+    // Branch-free capture validation
     vuint64m1_t zero_vec = __riscv_vmv_v_x_u64m1(0, vl);
     vuint64m1_t left_check = __riscv_vand_vv_u64m1(left_shift_vec_next, playing_vec, vl);
     vuint64m1_t right_check = __riscv_vand_vv_u64m1(right_shift_vec_next, playing_vec, vl);
 
-    // Create masks: true where check != 0 (i.e., friendly piece found)
     vbool64_t left_valid = __riscv_vmsne_vv_u64m1_b64(left_check, zero_vec, vl);
     vbool64_t right_valid = __riscv_vmsne_vv_u64m1_b64(right_check, zero_vec, vl);
 
-    // Zero out invalid captures, keep valid ones
     vuint64m1_t capture_left = __riscv_vmerge_vvm_u64m1(zero_vec, left_shift_vec, left_valid, vl);
     vuint64m1_t capture_right = __riscv_vmerge_vvm_u64m1(zero_vec, right_shift_vec, right_valid, vl);
 
-    // OR all captures together using reduction
     vuint64m1_t capture_all = __riscv_vor_vv_u64m1(capture_left, capture_right, vl);
     vuint64m1_t zero_scalar = __riscv_vmv_v_x_u64m1(0, 1);
     vuint64m1_t reduced = __riscv_vredor_vs_u64m1_u64m1(capture_all, zero_scalar, vl);
